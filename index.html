@@ -21,6 +21,11 @@
     button{width:100%;font:inherit;font-weight:700;margin-top:23px;border:0;border-radius:9px;
       padding:13px 16px;background:#274a67;color:#fff;cursor:pointer}
     button:disabled{opacity:.6;cursor:progress}
+    .remember-row{display:flex;align-items:flex-start;gap:10px;line-height:1.4;font-weight:500;cursor:pointer}
+    .remember-row input{width:18px;height:18px;margin:2px 0 0;flex:none;accent-color:#274a67}
+    button.secondary{background:transparent;color:inherit;border:1px solid #afbac6;margin-top:8px;font-size:.84rem;padding:10px}
+    #stored-hint{font-size:.84rem;color:#556372;line-height:1.4;margin:12px 0 0}
+    @media(prefers-color-scheme:dark){#stored-hint{color:#bfccd9}}
     small{font-size:.79rem;line-height:1.55;display:block;margin-top:13px;color:#657281}
     a{color:#315d83}
     #error{color:#a52424;line-height:1.45;font-size:.9rem;margin-top:15px}
@@ -47,11 +52,17 @@
       <input id="passphrase" type="password" autocomplete="new-password" required minlength="20" placeholder="Votre phrase secrète">
       <label for="token">Jeton GitHub à accès limité</label>
       <input id="token" type="password" autocomplete="off" required placeholder="github_pat_…">
-      <small>Le jeton doit autoriser uniquement le dépôt <strong>saint-du-jour</strong> avec la permission « Contents: Read and write ». Il ne sera ni publié, ni conservé dans le navigateur. <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">Créer un jeton GitHub</a>.</small>
+      <label class="remember-row" for="remember-token">
+        <input id="remember-token" type="checkbox">
+        Mémoriser le jeton sur cet ordinateur (chiffré avec ma phrase secrète)
+      </label>
+      <p id="stored-hint" role="status" aria-live="polite"></p>
+      <button id="forget-token" type="button" class="secondary" hidden>Effacer le jeton mémorisé</button>
+      <small>Le jeton doit autoriser uniquement le dépôt <strong>saint-du-jour</strong> avec la permission « Contents: Read and write ». Il ne sera jamais publié ; si tu coches l’option, seule une version chiffrée sera mémorisée dans ce navigateur. <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">Créer un jeton GitHub</a>.</small>
       <button id="submit" type="submit">Déverrouiller l'importeur</button>
       <div id="error" role="alert" aria-live="polite"></div>
     </form>
-    <small>Seuls le formulaire et son code de déverrouillage sont publics. La phrase secrète ne part pas sur le réseau ; le jeton est transmis exclusivement à l'API GitHub.</small>
+    <small>Seuls le formulaire et son code sont publics. La phrase secrète ne quitte pas cet appareil ; le jeton n’est envoyé qu’à GitHub. Les partitions et les PDF restent exclusivement dans le dépôt privé.</small>
   </main>
   <iframe id="viewer" title="Importeur Saint du Jour" referrerpolicy="no-referrer"
     sandbox="allow-scripts allow-same-origin allow-modals allow-forms allow-downloads allow-popups"></iframe>
@@ -63,6 +74,33 @@
     const button=document.getElementById("submit");
     const error=document.getElementById("error");
     const viewer=document.getElementById("viewer");
+    const tokenInput=document.getElementById("token");
+    const rememberInput=document.getElementById("remember-token");
+    const forgetButton=document.getElementById("forget-token");
+    const storedHint=document.getElementById("stored-hint");
+    const STORAGE_KEY="saint-du-jour:github-token-chiffre:v1";
+    const TOKEN_KDF_ITERATIONS=600000;
+    function savedTokenRecord(){
+      try{return localStorage.getItem(STORAGE_KEY);}catch(e){return null;}
+    }
+    function showStoredState(){
+      const exists=!!savedTokenRecord();
+      tokenInput.required=!exists;
+      tokenInput.placeholder=exists?"Laisser vide pour utiliser le jeton mémorisé":"github_pat_…";
+      storedHint.textContent=exists
+        ?"Un jeton est mémorisé sous forme chiffrée ici. Laisse le champ vide et saisis ta phrase secrète."
+        :"Aucun jeton mémorisé sur cet ordinateur.";
+      forgetButton.hidden=!exists;
+      return exists;
+    }
+    rememberInput.checked=showStoredState();
+    forgetButton.addEventListener("click",()=>{
+      try{
+        localStorage.removeItem(STORAGE_KEY);
+        rememberInput.checked=false;
+        showStoredState();
+      }catch(e){error.textContent="Impossible d’effacer le jeton mémorisé depuis ce navigateur.";}
+    });
     const fromB64=str=>{
       const binary=atob(String(str||"").replace(/\s/g,""));
       const bytes=new Uint8Array(binary.length);
@@ -85,6 +123,42 @@
         throw new Error("GitHub : "+(json.message||response.status));
       }
       return json;
+    }
+    const asBase64=bytes=>btoa(String.fromCharCode(...bytes));
+    async function deriveTokenKey(passphrase,salt){
+      const base=await crypto.subtle.importKey("raw",new TextEncoder().encode(passphrase),
+        "PBKDF2",false,["deriveKey"]);
+      return crypto.subtle.deriveKey({
+        name:"PBKDF2",salt,iterations:TOKEN_KDF_ITERATIONS,hash:"SHA-256"
+      },base,{name:"AES-GCM",length:256},false,["encrypt","decrypt"]);
+    }
+    async function protectToken(passphrase,token){
+      const salt=crypto.getRandomValues(new Uint8Array(16));
+      const iv=crypto.getRandomValues(new Uint8Array(12));
+      const key=await deriveTokenKey(passphrase,salt);
+      const encrypted=await crypto.subtle.encrypt({name:"AES-GCM",iv},key,
+        new TextEncoder().encode(token));
+      return JSON.stringify({
+        v:1,iterations:TOKEN_KDF_ITERATIONS,
+        salt:asBase64(salt),iv:asBase64(iv),
+        data:asBase64(new Uint8Array(encrypted))
+      });
+    }
+    async function restoreToken(passphrase){
+      const stored=savedTokenRecord();
+      if(!stored)throw new Error("Aucun jeton GitHub n’est mémorisé. Colle ton jeton pour te connecter.");
+      try{
+        const record=JSON.parse(stored);
+        if(record.v!==1||record.iterations!==TOKEN_KDF_ITERATIONS)
+          throw new Error("Format inconnu");
+        const key=await deriveTokenKey(passphrase,fromB64(record.salt));
+        const plain=await crypto.subtle.decrypt({
+          name:"AES-GCM",iv:fromB64(record.iv)
+        },key,fromB64(record.data));
+        return new TextDecoder("utf-8",{fatal:true}).decode(plain);
+      }catch(e){
+        throw new Error("Impossible de déchiffrer le jeton mémorisé. Vérifie ta phrase secrète ou efface le jeton pour en saisir un nouveau.");
+      }
     }
     async function unlock(passphrase,token){
       const file=await github(API+"/contents/github-only/site.enc?ref=importer-site",token);
@@ -121,12 +195,23 @@
       button.disabled=true;
       button.textContent="Ouverture du dépôt privé…";
       const passphrase=document.getElementById("passphrase").value;
-      const token=document.getElementById("token").value.trim();
-      // Ne rien sauvegarder dans localStorage, sessionStorage, cookies ou IndexedDB.
+      const typedToken=tokenInput.value.trim();
+      // Phrase secrète et jeton en clair uniquement dans la mémoire de cette session.
       document.getElementById("passphrase").value="";
-      document.getElementById("token").value="";
+      tokenInput.value="";
       try{
+        const token=typedToken||await restoreToken(passphrase);
         const html=await unlock(passphrase,token);
+        if(rememberInput.checked){
+          try{
+            const ciphertext=await protectToken(passphrase,token);
+            localStorage.setItem(STORAGE_KEY,ciphertext);
+          }catch(e){
+            window.alert("L’importeur est déverrouillé, mais le navigateur n’a pas pu mémoriser ton jeton chiffré.");
+          }
+        }else if(savedTokenRecord()){
+          try{localStorage.removeItem(STORAGE_KEY);}catch(e){}
+        }
         viewer.addEventListener("load",()=>{
           viewer.contentWindow.postMessage({
             type:"saint-du-jour/github-auth",token
@@ -136,6 +221,7 @@
         document.body.classList.add("open");
       }catch(e){
         error.textContent=e.message||"Déverrouillage impossible";
+        showStoredState();
       }finally{
         button.disabled=false;
         button.textContent="Déverrouiller l'importeur";
