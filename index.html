@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <title>Accès privé — Saint du Jour</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color-scheme:light dark}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100dvh;background:#f2f0eb;color:#202a35;display:grid;place-items:center}
+    .gate{width:min(440px,calc(100% - 36px));padding:36px;background:#fff;border:1px solid #e3dfd6;
+      border-radius:18px;box-shadow:0 16px 48px #15192312}
+    .symbol{font-size:31px;color:#7b6151}
+    h1{font-size:1.65rem;letter-spacing:-.035em;margin:.5rem 0}
+    .hint{font-size:.94rem;color:#556372;line-height:1.5;margin:0 0 25px}
+    label{display:block;font-size:.86rem;font-weight:700;margin:18px 0 7px}
+    input{font:inherit;width:100%;padding:13px;border:1px solid #afbac6;border-radius:9px;background:#fff;color:#1c2430}
+    input:focus{outline:3px solid #8ca5bc66;border-color:#426d91}
+    button{width:100%;font:inherit;font-weight:700;margin-top:23px;border:0;border-radius:9px;
+      padding:13px 16px;background:#274a67;color:#fff;cursor:pointer}
+    button:disabled{opacity:.6;cursor:progress}
+    small{font-size:.79rem;line-height:1.55;display:block;margin-top:13px;color:#657281}
+    a{color:#315d83}
+    #error{color:#a52424;line-height:1.45;font-size:.9rem;margin-top:15px}
+    #viewer{display:none;border:0;width:100%;height:100dvh;background:white}
+    body.open{display:block;background:white}
+    body.open .gate{display:none}
+    body.open #viewer{display:block}
+    @media(prefers-color-scheme:dark){
+      body{background:#151c25;color:#edf0f4}
+      .gate{background:#222c39;border-color:#3b4757}
+      .hint,small{color:#bfccd9}
+      input{background:#111923;color:#fff;border-color:#586b7f}
+      a{color:#a5cafa}
+    }
+  </style>
+</head>
+<body>
+  <main class="gate">
+    <div class="symbol" aria-hidden="true">✝</div>
+    <h1>Saint du Jour</h1>
+    <p class="hint">Importer des partitions. L'interface et toutes les données sont conservées dans un dépôt GitHub privé. Déverrouillage uniquement sur cet appareil, pour cette session.</p>
+    <form id="unlock" autocomplete="off">
+      <label for="passphrase">Phrase secrète</label>
+      <input id="passphrase" type="password" autocomplete="new-password" required minlength="20" placeholder="Votre phrase secrète">
+      <label for="token">Jeton GitHub à accès limité</label>
+      <input id="token" type="password" autocomplete="off" required placeholder="github_pat_…">
+      <small>Le jeton doit autoriser uniquement le dépôt <strong>saint-du-jour</strong> avec la permission « Contents: Read and write ». Il ne sera ni publié, ni conservé dans le navigateur. <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">Créer un jeton GitHub</a>.</small>
+      <button id="submit" type="submit">Déverrouiller l'importeur</button>
+      <div id="error" role="alert" aria-live="polite"></div>
+    </form>
+    <small>Seuls le formulaire et son code de déverrouillage sont publics. La phrase secrète ne part pas sur le réseau ; le jeton est transmis exclusivement à l'API GitHub.</small>
+  </main>
+  <iframe id="viewer" title="Importeur Saint du Jour" referrerpolicy="no-referrer"
+    sandbox="allow-scripts allow-same-origin allow-modals allow-forms allow-downloads allow-popups"></iframe>
+  <script>
+  (function(){
+    "use strict";
+    const API="https://api.github.com/repos/theomondoud-byte/saint-du-jour";
+    const form=document.getElementById("unlock");
+    const button=document.getElementById("submit");
+    const error=document.getElementById("error");
+    const viewer=document.getElementById("viewer");
+    const fromB64=str=>{
+      const binary=atob(String(str||"").replace(/\s/g,""));
+      const bytes=new Uint8Array(binary.length);
+      for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
+      return bytes;
+    };
+    async function github(url,token){
+      const response=await fetch(url,{
+        cache:"no-store",
+        headers:{
+          "Authorization":"Bearer "+token,
+          "Accept":"application/vnd.github+json",
+          "X-GitHub-Api-Version":"2022-11-28"
+        }
+      });
+      const json=await response.json().catch(()=>({}));
+      if(!response.ok){
+        if(response.status===404)throw new Error("Fichier chiffré introuvable ou accès au dépôt refusé. Vérifiez le jeton et le lancement du workflow « Construire l'importeur privé chiffré ».");
+        if(response.status===401||response.status===403)throw new Error("Accès GitHub refusé. Vérifiez la date de validité et les autorisations du jeton.");
+        throw new Error("GitHub : "+(json.message||response.status));
+      }
+      return json;
+    }
+    async function unlock(passphrase,token){
+      const file=await github(API+"/contents/github-only/site.enc?ref=importer-site",token);
+      let content;
+      if(file.content&&file.encoding==="base64")content=fromB64(file.content);
+      else{
+        const blob=await github(API+"/git/blobs/"+encodeURIComponent(file.sha),token);
+        content=fromB64(blob.content);
+      }
+      const payload=JSON.parse(new TextDecoder().decode(content));
+      if(payload.format!=="saint-du-jour-encrypted-importer-v1"||
+         payload.iterations!==600000||payload.kdf!=="PBKDF2-SHA256")
+        throw new Error("Format de l'importeur chiffré inconnu.");
+      const rootKey=await crypto.subtle.importKey("raw",new TextEncoder().encode(passphrase),
+        "PBKDF2",false,["deriveKey"]);
+      const key=await crypto.subtle.deriveKey({
+        name:"PBKDF2",salt:fromB64(payload.salt),iterations:payload.iterations,hash:"SHA-256"
+      },rootKey,{name:"AES-GCM",length:256},false,["decrypt"]);
+      let plain;
+      try{
+        plain=await crypto.subtle.decrypt({name:"AES-GCM",iv:fromB64(payload.iv)},
+          key,fromB64(payload.data));
+      }catch(e){
+        throw new Error("Phrase secrète incorrecte, ou fichier chiffré endommagé.");
+      }
+      if(!window.DecompressionStream)throw new Error("Navigateur trop ancien : décompression GZIP indisponible.");
+      const compressed=new Blob([plain]).stream().pipeThrough(new DecompressionStream("gzip"));
+      const html=new TextDecoder("utf-8",{fatal:true}).decode(await new Response(compressed).arrayBuffer());
+      return html;
+    }
+    form.addEventListener("submit",async event=>{
+      event.preventDefault();
+      error.textContent="";
+      button.disabled=true;
+      button.textContent="Ouverture du dépôt privé…";
+      const passphrase=document.getElementById("passphrase").value;
+      const token=document.getElementById("token").value.trim();
+      // Ne rien sauvegarder dans localStorage, sessionStorage, cookies ou IndexedDB.
+      document.getElementById("passphrase").value="";
+      document.getElementById("token").value="";
+      try{
+        const html=await unlock(passphrase,token);
+        viewer.addEventListener("load",()=>{
+          viewer.contentWindow.postMessage({
+            type:"saint-du-jour/github-auth",token
+          },window.location.origin);
+        },{once:true});
+        viewer.srcdoc=html;
+        document.body.classList.add("open");
+      }catch(e){
+        error.textContent=e.message||"Déverrouillage impossible";
+      }finally{
+        button.disabled=false;
+        button.textContent="Déverrouiller l'importeur";
+      }
+    });
+  })();
+  </script>
+</body>
+</html>
